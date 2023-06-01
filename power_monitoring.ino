@@ -3,6 +3,7 @@
 #include <ArduinoHttpClient.h>
 #include <MKRGSM.h>
 #include <Arduino_PMIC.h>
+#include "ArduinoLowPower.h"
 #include "arduino_secrets.h"
 
 enum POWER_STATE {
@@ -10,7 +11,6 @@ enum POWER_STATE {
   POWER_OFF,
 };
 
-const int retries = 5;
 const char pinnumber[] = SECRET_PINNUMBER;
 const char gprs_apn[] = SECRET_GPRS_APN;
 const char gprs_login[] = SECRET_GPRS_LOGIN;
@@ -18,8 +18,11 @@ const char gprs_password[] = SECRET_GPRS_PASSWORD;
 const char backend_host[] = BACKEND_HOST;
 const int backend_port = BACKEND_PORT;
 const char user_agent[] = USER_AGENT;
+const char api_path[] = BACKEND_API_PATH;
+
 const char content_type[] = "application/json";
-const char api_path[] = "/api/power/state";
+const int cycles_between_gsm_recconect = 15;
+const int send_request_retries = 5;
 const unsigned long send_interval = 15000L;
 
 Arduino_CRC32 crc32;
@@ -80,21 +83,31 @@ void loop() {
     signal_strength = 0;
   }
 
-  float battery_level = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
-  float battery_percentage = map(battery_level, 3.6, 4.2, 0, 100);
+  float battery_voltage = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
+  float battery_percentage = floor(((battery_voltage - 3.5) / 0.7) * 100);
   int signal_strength_percentage = map(signal_strength, 0, 33, 0, 100);
 
-  show_telemetry(signal_strength, signal_strength_percentage, battery_level, battery_percentage, cycles);
+  show_telemetry(signal_strength, signal_strength_percentage, battery_voltage, battery_percentage, cycles);
 
   check_power_data(battery_percentage, signal_strength_percentage);
-  if (cycles >= 30) {
+
+  if (cycles >= cycles_between_gsm_recconect) {
     cycles = 0;
     shutdown_gprs();
   }
 
-  println_info("Ending_loop...");
+  
   cycles += 1;
-  delay(10000);
+  println_info("Ending_loop...");
+  wait_for_delay();
+}
+
+void wait_for_delay() {
+  if (cycles == 1) {
+    LowPower.sleep(6500);
+  } else {
+    delay(6500);
+  }
 }
 
 void check_usb_mode(const float battery_percentage, const int network_level) {
@@ -103,7 +116,16 @@ void check_usb_mode(const float battery_percentage, const int network_level) {
     case ADAPTER_PORT_MODE:
     case BOOST_MODE:
     case USB_HOST_MODE:
-      try_update_state(POWER_ON, battery_percentage, network_level);
+      if ((millis() - time_since_last_update) >= send_interval) {
+        try_update_state(POWER_ON, battery_percentage, network_level);
+      }
+
+      break;
+    default:
+      if ((millis() - time_since_last_update) >= send_interval) {
+        try_update_state(POWER_OFF, battery_percentage, network_level);
+      }
+
       break;
   }
 }
@@ -115,6 +137,7 @@ void check_power_data(const float battery_percentage, const int network_level) {
       if ((millis() - time_since_last_update) >= send_interval) {
         try_update_state(POWER_OFF, battery_percentage, network_level);
       }
+
       break;
     case PRE_CHARGING:
     case FAST_CHARGING:
@@ -122,18 +145,17 @@ void check_power_data(const float battery_percentage, const int network_level) {
       if ((millis() - time_since_last_update) >= send_interval) {
         try_update_state(POWER_ON, battery_percentage, network_level);
       }
+
       break;
     default:
-      if ((millis() - time_since_last_update) >= send_interval) {
-        check_usb_mode(battery_percentage, network_level);
-      }
+      check_usb_mode(battery_percentage, network_level);
+
       break;
   }
 }
 
 void try_update_state(const POWER_STATE state, const float battery_percentage, const int network_level) {
-  int attempts = retries;
-  println_info("Starting try update");
+  int attempts = send_request_retries;
   while (attempts > 0) {
     if (send_post(state, battery_percentage, network_level)) {
       time_since_last_update = millis();
@@ -149,40 +171,42 @@ bool connect_gprs() {
   if (gprs_connected) {
     return true;
   }
-  println_info("Starting_connect_gprs");
+
+  println_info("Starting_gprs_connection");
   bool connected = false;
   while (!connected) {
     if ((gsmAccess.begin(pinnumber) == GSM_READY) && (gprs.attachGPRS(gprs_apn, gprs_login, gprs_password) == GPRS_READY)) {
       connected = true;
     } else {
-      println_info("Steel_connect_gprs...");
-      delay(1000);
+      println_info("Waiting_for_gprs_connection...");
+      delay(500);
     }
   }
 
   gprs_connected = true;
 
-  println_info("Ending_connect_gprs");
+  println_info("GRPS_connected");
 
   return true;
 }
 
 void shutdown_gprs() {
-  println_info("shutdown_gprs");
+  println_info("GRPS_shutting_down");
   gsmAccess.shutdown();
   gprs_connected = false;
+
 }
 
 bool send_post(const int state, const float battery_percentage, const int network_level) {
   if (!httpClient.connect(backend_host, backend_port)) {
-    println_info("Connection-failure");
+    println_info("Failed_to_connect_to_backend");
     httpClient.stop();
-    delay(1000);
+    delay(500);
 
     return false;
   }
 
-  println_info("Preparing_POST");
+  println_info("Preparing_POST_request");
 
   StaticJsonDocument<128> json;
   json["device_id"] = device_crc_id;
